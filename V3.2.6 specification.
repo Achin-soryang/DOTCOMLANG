@@ -1,0 +1,1036 @@
+"""
+DOTCOMLANG V3.2.6 Reference Interpreter
+
+Implements the core language semantics defined by the
+DOTCOMLANG V3.2.6 Final Deterministic Specification.
+"""
+
+import re
+
+
+# ============================================================
+# Canonical tokens
+# ============================================================
+
+TOK_START = ".,."
+TOK_PUSH = ".,.."
+TOK_ADD = ".,.,."
+TOK_SUB = ",.,.,"
+TOK_MUL = ".,.,,"
+TOK_DIV = "..,.."
+TOK_MOD = ".,..,.,"
+
+TOK_EQ = ":'\".,"
+TOK_GT = ":'.,.,"
+TOK_LT = ":,'.,."
+
+TOK_INPUT = ":'.,"
+TOK_OUTPUT = ";'.,"
+
+TOK_IF = "^.,."
+TOK_ELSE = "^..,.,"
+TOK_ENDIF = "^..,"
+
+TOK_WSTART = "°.,.."
+TOK_WEND = "°..,"
+
+TOK_CALL = "∼.,."
+TOK_RET = "∼..,"
+
+TOK_COMMENT = "`.,."
+
+TOK_VERIFY = "~'.,"
+TOK_HALT = "°.,."
+
+TOK_ZERO = ",.,.,.,"
+
+VERIFY_REQUIRED = {
+    TOK_ADD,
+    TOK_SUB,
+    TOK_MUL,
+    TOK_DIV,
+    TOK_MOD,
+    TOK_EQ,
+    TOK_GT,
+    TOK_LT,
+}
+
+INSTRUCTIONS = {
+    TOK_START,
+    TOK_PUSH,
+    TOK_ADD,
+    TOK_SUB,
+    TOK_MUL,
+    TOK_DIV,
+    TOK_MOD,
+    TOK_EQ,
+    TOK_GT,
+    TOK_LT,
+    TOK_INPUT,
+    TOK_OUTPUT,
+    TOK_IF,
+    TOK_ELSE,
+    TOK_ENDIF,
+    TOK_WSTART,
+    TOK_WEND,
+    TOK_CALL,
+    TOK_RET,
+    TOK_VERIFY,
+    TOK_HALT,
+}
+
+ALLOWED_CHARS = set('.,\'":;~^°∼`')
+
+
+# ============================================================
+# Errors
+# ============================================================
+
+class DotcomError(Exception):
+    def __init__(self, kind, message=""):
+        self.kind = kind
+        self.message = message
+
+        if message:
+            super().__init__(f"{kind}: {message}")
+        else:
+            super().__init__(kind)
+
+
+# ============================================================
+# Number handling
+# ============================================================
+
+def is_number_token(token):
+    """
+    Returns (True, value) for a valid DOTCOMLANG number.
+    Returns (False, None) otherwise.
+    """
+
+    # Reserved zero representation.
+    if token == TOK_ZERO:
+        return True, 0
+
+    if len(token) < 3:
+        return False, None
+
+    if token[0] != "," or token[-1] != ",":
+        return False, None
+
+    # Exactly two commas.
+    if token.count(",") != 2:
+        return False, None
+
+    inner = token[1:-1]
+
+    if not inner:
+        return False, None
+
+    if all(ch == "." for ch in inner):
+        return True, len(inner)
+
+    return False, None
+
+
+# ============================================================
+# Lexical analysis
+# ============================================================
+
+def lex(source):
+    """
+    Removes whitespace-delimited comments and validates
+    executable characters.
+    """
+
+    raw_tokens = source.split()
+    executable = []
+    in_comment = False
+
+    for token in raw_tokens:
+
+        if token == TOK_COMMENT:
+            in_comment = not in_comment
+            continue
+
+        if in_comment:
+            continue
+
+        for char in token:
+            if char not in ALLOWED_CHARS:
+                raise DotcomError(
+                    "LEXICAL ERROR",
+                    f"invalid character: {char!r}"
+                )
+
+        executable.append(token)
+
+    if in_comment:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "unterminated comment"
+        )
+
+    return executable
+
+
+# ============================================================
+# Structural validation
+# ============================================================
+
+def validate_structure(tokens):
+    """
+    Performs structural validation and creates static
+    control-flow information.
+    """
+
+    if not tokens:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "empty program"
+        )
+
+    # Exactly one START and HALT.
+    if tokens.count(TOK_START) != 1:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "program must contain exactly one START"
+        )
+
+    if tokens[0] != TOK_START:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "START must be first"
+        )
+
+    if tokens.count(TOK_HALT) != 1:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "program must contain exactly one HALT"
+        )
+
+    # --------------------------------------------------------
+    # Operand validation
+    # --------------------------------------------------------
+
+    i = 0
+
+    while i < len(tokens):
+        token = tokens[i]
+
+        if token in (TOK_PUSH, TOK_CALL):
+
+            if i + 1 >= len(tokens):
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    f"missing operand after {token}"
+                )
+
+            is_num, _ = is_number_token(tokens[i + 1])
+
+            if not is_num:
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    f"invalid operand after {token}"
+                )
+
+            i += 2
+            continue
+
+        is_num, _ = is_number_token(token)
+
+        if is_num:
+            raise DotcomError(
+                "PROGRAM STRUCTURE ERROR",
+                f"stray numeric operand: {token}"
+            )
+
+        i += 1
+
+    # --------------------------------------------------------
+    # Static structural matching
+    # --------------------------------------------------------
+
+    depth = 0
+    depths = [0] * len(tokens)
+
+    if_stack = []
+    while_stack = []
+
+    if_to_else = {}
+    if_to_endif = {}
+    else_to_endif = {}
+    while_to_end = {}
+
+    # Each IF stack entry is:
+    # (if_address, else_address_or_None)
+
+    for index, token in enumerate(tokens):
+
+        is_num, _ = is_number_token(token)
+
+        if is_num:
+            depths[index] = depth
+            continue
+
+        if token == TOK_IF:
+            depths[index] = depth
+            if_stack.append([index, None])
+            depth += 1
+
+        elif token == TOK_ELSE:
+
+            if not if_stack:
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    "unmatched ELSE"
+                )
+
+            # ELSE belongs to nearest unmatched IF.
+            if_index, existing_else = if_stack[-1]
+
+            if existing_else is not None:
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    "multiple ELSE clauses for one IF"
+                )
+
+            depth -= 1
+            depths[index] = depth
+
+            if_to_else[if_index] = index
+            if_stack[-1][1] = index
+
+            depth += 1
+
+        elif token == TOK_ENDIF:
+
+            if not if_stack:
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    "unmatched ENDIF"
+                )
+
+            depth -= 1
+            depths[index] = depth
+
+            if_index, else_index = if_stack.pop()
+
+            if else_index is None:
+                if_to_endif[if_index] = index
+            else:
+                else_to_endif[else_index] = index
+                if_to_endif[if_index] = index
+
+        elif token == TOK_WSTART:
+
+            depths[index] = depth
+            while_stack.append(index)
+            depth += 1
+
+        elif token == TOK_WEND:
+
+            if not while_stack:
+                raise DotcomError(
+                    "PROGRAM STRUCTURE ERROR",
+                    "unmatched WHILE END"
+                )
+
+            depth -= 1
+            depths[index] = depth
+
+            start_index = while_stack.pop()
+            while_to_end[start_index] = index
+
+        else:
+            depths[index] = depth
+
+    if if_stack:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "unterminated IF structure"
+        )
+
+    if while_stack:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "unterminated WHILE structure"
+        )
+
+    if depth != 0:
+        raise DotcomError(
+            "PROGRAM STRUCTURE ERROR",
+            "invalid structural depth"
+        )
+
+    return {
+        "depths": depths,
+        "if_to_else": if_to_else,
+        "if_to_endif": if_to_endif,
+        "else_to_endif": else_to_endif,
+        "while_to_end": while_to_end,
+    }
+
+
+# ============================================================
+# Integer division
+# ============================================================
+
+def trunc_div(a, b):
+    """
+    Integer division truncated toward zero.
+
+    This avoids converting arbitrary-precision integers
+    to floating-point values.
+    """
+
+    if b == 0:
+        raise ZeroDivisionError
+
+    quotient = abs(a) // abs(b)
+
+    if (a < 0) != (b < 0):
+        return -quotient
+
+    return quotient
+
+
+# ============================================================
+# Primary execution operations
+# ============================================================
+
+def primary_compute(operation, a, b):
+
+    if operation == TOK_ADD:
+        return a + b
+
+    if operation == TOK_SUB:
+        return a - b
+
+    if operation == TOK_MUL:
+        return a * b
+
+    if operation == TOK_DIV:
+        return trunc_div(a, b)
+
+    if operation == TOK_MOD:
+        return a - trunc_div(a, b) * b
+
+    if operation == TOK_EQ:
+        return 1 if a == b else 0
+
+    if operation == TOK_GT:
+        return 1 if a > b else 0
+
+    if operation == TOK_LT:
+        return 1 if a < b else 0
+
+    raise DotcomError(
+        "PROGRAM STRUCTURE ERROR",
+        f"unknown operation: {operation}"
+    )
+
+
+# ============================================================
+# Independent verification path
+# ============================================================
+
+def verification_compute(operation, a, b):
+
+    if operation == TOK_ADD:
+        result = b + a
+        return result
+
+    if operation == TOK_SUB:
+        result = a - b
+        return result
+
+    if operation == TOK_MUL:
+        result = a * b
+        return result
+
+    if operation == TOK_DIV:
+        negative = (a < 0) != (b < 0)
+        quotient = abs(a) // abs(b)
+
+        if negative:
+            quotient = -quotient
+
+        return quotient
+
+    if operation == TOK_MOD:
+        quotient = verification_compute(TOK_DIV, a, b)
+        return a - quotient * b
+
+    if operation == TOK_EQ:
+        return int(not (a < b or a > b))
+
+    if operation == TOK_GT:
+        return int(a > b)
+
+    if operation == TOK_LT:
+        return int(a < b)
+
+    raise DotcomError(
+        "PROGRAM STRUCTURE ERROR",
+        f"unknown verification operation: {operation}"
+    )
+
+
+# ============================================================
+# Input handling
+# ============================================================
+
+INPUT_PATTERN = re.compile(r"^[+-]?[0-9]+$")
+
+
+def parse_input_value(value):
+
+    text = str(value).strip()
+
+    if not INPUT_PATTERN.fullmatch(text):
+        return None
+
+    return int(text)
+
+
+# ============================================================
+# Interpreter
+# ============================================================
+
+def run(source, input_values=None, limits=None):
+
+    if input_values is None:
+        input_values = []
+
+    if limits is None:
+        limits = {}
+
+    max_steps = limits.get("max_steps", 100000)
+    max_call_depth = limits.get("max_call_depth", 1000)
+    max_stack = limits.get("max_stack", 10000)
+    max_int_digits = limits.get("max_int_digits", 10000)
+    max_output = limits.get("max_output", 10000)
+
+    # --------------------------------------------------------
+    # Lexical + structural phases
+    # --------------------------------------------------------
+
+    tokens = lex(source)
+    structure = validate_structure(tokens)
+
+    depths = structure["depths"]
+    if_to_else = structure["if_to_else"]
+    if_to_endif = structure["if_to_endif"]
+    else_to_endif = structure["else_to_endif"]
+    while_to_end = structure["while_to_end"]
+
+    # --------------------------------------------------------
+    # Machine state
+    # --------------------------------------------------------
+
+    data_stack = []
+
+    # Main frame starts with no return address.
+    call_stack = [
+        {
+            "return_addr": None,
+            "ctrl_stack": [],
+        }
+    ]
+
+    ip = 0
+
+    verify_state = "NORMAL"
+    pending_operation = None
+    pending_operands = None
+    pending_result = None
+
+    input_index = 0
+    outputs = []
+
+    steps = 0
+
+    # --------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------
+
+    def current_ctrl_stack():
+        return call_stack[-1]["ctrl_stack"]
+
+    def operand_at(address):
+        if address < 0 or address >= len(tokens):
+            raise DotcomError(
+                "PROGRAM STRUCTURE ERROR",
+                "operand address out of range"
+            )
+
+        is_num, value = is_number_token(tokens[address])
+
+        if not is_num:
+            raise DotcomError(
+                "PROGRAM STRUCTURE ERROR",
+                "expected numeric operand"
+            )
+
+        return value
+
+    def check_stack_size():
+        if len(data_stack) > max_stack:
+            raise DotcomError(
+                "RESOURCE LIMIT EXCEEDED",
+                "maximum stack size exceeded"
+            )
+
+    # --------------------------------------------------------
+    # Main execution loop
+    # --------------------------------------------------------
+
+    while True:
+
+        if ip < 0 or ip >= len(tokens):
+            raise DotcomError(
+                "PROGRAM STRUCTURE ERROR",
+                "instruction pointer out of range"
+            )
+
+        steps += 1
+
+        if steps > max_steps:
+            raise DotcomError(
+                "RESOURCE LIMIT EXCEEDED",
+                "maximum execution steps exceeded"
+            )
+
+        token = tokens[ip]
+
+        # Numeric operands are never independently executed.
+        is_num, _ = is_number_token(token)
+
+        if is_num:
+            ip += 1
+            continue
+
+        # ----------------------------------------------------
+        # Mandatory verification
+        # ----------------------------------------------------
+
+        if (
+            verify_state == "AWAITING_VERIFY"
+            and token != TOK_VERIFY
+        ):
+            raise DotcomError(
+                "MISSING VERIFY",
+                f"expected {TOK_VERIFY}, got {token}"
+            )
+
+        # ----------------------------------------------------
+        # START
+        # ----------------------------------------------------
+
+        if token == TOK_START:
+
+            ip += 1
+
+        # ----------------------------------------------------
+        # PUSH
+        # ----------------------------------------------------
+
+        elif token == TOK_PUSH:
+
+            value = operand_at(ip + 1)
+
+            if len(str(abs(value))) > max_int_digits:
+                raise DotcomError(
+                    "RESOURCE LIMIT EXCEEDED",
+                    "integer representation limit exceeded"
+                )
+
+            data_stack.append(value)
+            check_stack_size()
+
+            ip += 2
+
+        # ----------------------------------------------------
+        # Arithmetic / comparison operations
+        # ----------------------------------------------------
+
+        elif token in VERIFY_REQUIRED:
+
+            if len(data_stack) < 2:
+                raise DotcomError("STACK UNDERFLOW")
+
+            # [a][b] means a = left, b = right.
+            a = data_stack[-2]
+            b = data_stack[-1]
+
+            if token in (TOK_DIV, TOK_MOD) and b == 0:
+
+                if token == TOK_DIV:
+                    raise DotcomError("DIVISION BY ZERO")
+
+                raise DotcomError("MODULO BY ZERO")
+
+            # Calculate before changing stack state.
+            result = primary_compute(token, a, b)
+
+            if len(str(abs(result))) > max_int_digits:
+                raise DotcomError(
+                    "RESOURCE LIMIT EXCEEDED",
+                    "integer representation limit exceeded"
+                )
+
+            # Atomic stack modification.
+            del data_stack[-2:]
+            data_stack.append(result)
+
+            verify_state = "AWAITING_VERIFY"
+            pending_operation = token
+            pending_operands = (a, b)
+            pending_result = result
+
+            check_stack_size()
+
+            ip += 1
+
+        # ----------------------------------------------------
+        # VERIFY
+        # ----------------------------------------------------
+
+        elif token == TOK_VERIFY:
+
+            if verify_state == "AWAITING_VERIFY":
+
+                a, b = pending_operands
+
+                verified_result = verification_compute(
+                    pending_operation,
+                    a,
+                    b,
+                )
+
+                if verified_result != pending_result:
+                    raise DotcomError("VERIFY FAILED")
+
+                verify_state = "NORMAL"
+                pending_operation = None
+                pending_operands = None
+                pending_result = None
+
+            ip += 1
+
+        # ----------------------------------------------------
+        # INPUT
+        # ----------------------------------------------------
+
+        elif token == TOK_INPUT:
+
+            while True:
+
+                if input_index >= len(input_values):
+                    raise DotcomError(
+                        "INVALID INPUT",
+                        "EOF"
+                    )
+
+                raw_value = input_values[input_index]
+                input_index += 1
+
+                value = parse_input_value(raw_value)
+
+                if value is not None:
+                    break
+
+            if len(str(abs(value))) > max_int_digits:
+                raise DotcomError(
+                    "RESOURCE LIMIT EXCEEDED",
+                    "integer representation limit exceeded"
+                )
+
+            data_stack.append(value)
+            check_stack_size()
+
+            ip += 1
+
+        # ----------------------------------------------------
+        # OUTPUT
+        # ----------------------------------------------------
+
+        elif token == TOK_OUTPUT:
+
+            if not data_stack:
+                raise DotcomError("STACK UNDERFLOW")
+
+            if len(outputs) >= max_output:
+                raise DotcomError(
+                    "RESOURCE LIMIT EXCEEDED",
+                    "maximum output limit exceeded"
+                )
+
+            outputs.append(str(data_stack[-1]))
+
+            ip += 1
+
+        # ----------------------------------------------------
+        # IF
+        # ----------------------------------------------------
+
+        elif token == TOK_IF:
+
+            if not data_stack:
+                raise DotcomError("STACK UNDERFLOW")
+
+            condition = data_stack[-1]
+
+            if condition not in (0, 1):
+                raise DotcomError("INVALID CONDITION")
+
+            # Condition is consumed only after validation.
+            data_stack.pop()
+
+            frame_ctrl = current_ctrl_stack()
+
+            if condition == 1:
+
+                frame_ctrl.append({
+                    "type": "IF",
+                    "start": ip,
+                    "state": "TRUE",
+                })
+
+                ip += 1
+
+            else:
+
+                frame_ctrl.append({
+                    "type": "IF",
+                    "start": ip,
+                    "state": "FALSE",
+                })
+
+                if ip in if_to_else:
+                    ip = if_to_else[ip] + 1
+                else:
+                    ip = if_to_endif[ip] + 1
+
+        # ----------------------------------------------------
+        # ELSE
+        # ----------------------------------------------------
+
+        elif token == TOK_ELSE:
+
+            frame_ctrl = current_ctrl_stack()
+
+            if not frame_ctrl:
+                raise DotcomError("UNMATCHED ELSE")
+
+            top = frame_ctrl[-1]
+
+            if top["type"] != "IF":
+                raise DotcomError("UNMATCHED ELSE")
+
+            if top["state"] == "TRUE":
+
+                end_address = if_to_endif[top["start"]]
+
+                frame_ctrl.pop()
+                ip = end_address + 1
+
+            else:
+
+                top["state"] = "TRUE"
+                ip += 1
+
+        # ----------------------------------------------------
+        # ENDIF
+        # ----------------------------------------------------
+
+        elif token == TOK_ENDIF:
+
+            frame_ctrl = current_ctrl_stack()
+
+            if not frame_ctrl:
+                raise DotcomError("UNMATCHED ENDIF")
+
+            top = frame_ctrl[-1]
+
+            if top["type"] != "IF":
+                raise DotcomError("UNMATCHED ENDIF")
+
+            frame_ctrl.pop()
+            ip += 1
+
+        # ----------------------------------------------------
+        # WHILE START
+        # ----------------------------------------------------
+
+        elif token == TOK_WSTART:
+
+            if not data_stack:
+                raise DotcomError("STACK UNDERFLOW")
+
+            condition = data_stack[-1]
+
+            if condition not in (0, 1):
+                raise DotcomError("INVALID CONDITION")
+
+            frame_ctrl = current_ctrl_stack()
+
+            if condition == 1:
+
+                # Establish a loop frame only on first entry.
+                if not (
+                    frame_ctrl
+                    and frame_ctrl[-1]["type"] == "WHILE"
+                    and frame_ctrl[-1]["start"] == ip
+                ):
+                    frame_ctrl.append({
+                        "type": "WHILE",
+                        "start": ip,
+                    })
+
+                ip += 1
+
+            else:
+
+                # If the loop is currently active, remove it.
+                if (
+                    frame_ctrl
+                    and frame_ctrl[-1]["type"] == "WHILE"
+                    and frame_ctrl[-1]["start"] == ip
+                ):
+                    frame_ctrl.pop()
+
+                ip = while_to_end[ip] + 1
+
+        # ----------------------------------------------------
+        # WHILE END
+        # ----------------------------------------------------
+
+        elif token == TOK_WEND:
+
+            frame_ctrl = current_ctrl_stack()
+
+            if not frame_ctrl:
+                raise DotcomError("UNMATCHED WHILE END")
+
+            top = frame_ctrl[-1]
+
+            if top["type"] != "WHILE":
+                raise DotcomError("UNMATCHED WHILE END")
+
+            ip = top["start"]
+
+        # ----------------------------------------------------
+        # CALL
+        # ----------------------------------------------------
+
+        elif token == TOK_CALL:
+
+            target = operand_at(ip + 1)
+
+            if target < 0 or target >= len(tokens):
+                raise DotcomError("INVALID ADDRESS")
+
+            target_is_number, _ = is_number_token(tokens[target])
+
+            if target_is_number:
+                raise DotcomError("INVALID ADDRESS")
+
+            if tokens[target] == TOK_START:
+                raise DotcomError("INVALID ADDRESS")
+
+            if depths[target] != 0:
+                raise DotcomError("INVALID ADDRESS")
+
+            if tokens[target] in (
+                TOK_ELSE,
+                TOK_ENDIF,
+                TOK_WEND,
+            ):
+                raise DotcomError("INVALID ADDRESS")
+
+            if len(call_stack) >= max_call_depth + 1:
+                raise DotcomError(
+                    "RESOURCE LIMIT EXCEEDED",
+                    "maximum call depth exceeded"
+                )
+
+            # Save caller frame.
+            call_stack.append({
+                "return_addr": ip + 2,
+                "ctrl_stack": [],
+            })
+
+            ip = target
+
+        # ----------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------
+
+        elif token == TOK_RET:
+
+            if len(call_stack) == 1:
+                raise DotcomError("RETURN WITHOUT CALL")
+
+            frame_ctrl = current_ctrl_stack()
+
+            if frame_ctrl:
+                raise DotcomError(
+                    "UNTERMINATED STRUCTURE AT RETURN"
+                )
+
+            frame = call_stack.pop()
+
+            ip = frame["return_addr"]
+
+        # ----------------------------------------------------
+        # HALT
+        # ----------------------------------------------------
+
+        elif token == TOK_HALT:
+
+            if verify_state == "AWAITING_VERIFY":
+                raise DotcomError("MISSING VERIFY")
+
+            break
+
+        # ----------------------------------------------------
+        # Unknown token
+        # ----------------------------------------------------
+
+        else:
+
+            raise DotcomError(
+                "PROGRAM STRUCTURE ERROR",
+                f"unknown instruction: {token}"
+            )
+
+    return outputs
+
+
+# ============================================================
+# Simple command-line interface
+# ============================================================
+
+if __name__ == "__main__":
+
+    import sys
+
+    if len(sys.argv) != 2:
+        print("Usage: python reference_interpreter.py <program.dot>")
+        sys.exit(1)
+
+    filename = sys.argv[1]
+
+    try:
+        with open(filename, "r", encoding="utf-8") as file:
+            source = file.read()
+
+        result = run(source)
+
+        for value in result:
+            print(value)
+
+    except DotcomError as error:
+        print(error)
+        sys.exit(1)
